@@ -39,42 +39,75 @@ write_state() {
   } > "$STATE_DIR/$name.state"
 }
 
+notify_container_die() {
+  local name=$1
+  local timestamp=$(date "+%Y-%m-%d %H:%M:%S")
+
+  exit_info=$(docker inspect "$name" --format '{{.State.ExitCode}} {{.State.Error}}')
+  exit_code=$(echo "$exit_info" | awk '{print $1}')
+  exit_error=$(echo "$exit_info" | cut -d' ' -f2-)
+  pid=$(docker inspect -f '{{.State.Pid}}' "$name")
+  oom_log=$(dmesg -T | grep "$pid" | tail -n 3)
+  last_logs=$(docker logs --tail 50 "$name" 2>&1 | grep -Ei 'warn|error' | tail -n 10)
+
+  msg="[$timestamp] 🚨 Service [$name] DOWN.\n🧯 ExitCode=$exit_code"
+  [[ -n "$exit_error" && "$exit_error" != "<nil>" ]] && msg="$msg, Error: $exit_error"
+  [[ -n "$oom_log" ]] && msg="$msg\n💥 dmesg:\n$oom_log"
+  [[ -n "$last_logs" ]] && msg="$msg\n📋 Logs:\n$last_logs"
+
+  ./notify.sh "$msg"
+}
+
 watch_events() {
   docker events --filter event=die --filter event=start |
   while read -r line; do
     event_type=$(echo "$line" | grep -oP 'container \K(die|start)')
     name=$(echo "$line" | grep -oP 'name=\K[^,)]+')
-    image=$(echo "$line" | grep -oP 'image=\K[^,)]+')
     timestamp=$(date "+%Y-%m-%d %H:%M:%S")
     epoch=$(get_epoch)
 
     [[ -z "$event_type" || -z "$name" ]] && continue
     state_file="$STATE_DIR/$name.state"
-    touch "$state_file"
-    source "$state_file" 2>/dev/null || true
+
+    [[ -f "$state_file" ]] && source "$state_file" 2>/dev/null || {
+      status="up"
+      die_time=0
+      last_notified=""
+    }
 
     if [[ "$event_type" == "die" ]]; then
       is_watched "$name" || continue
-      echo "[$timestamp] ⚠️ [$name] stopped"
+
+      notify_container_die "$name"
       write_state "$name" "down" "$epoch" ""
 
-      # Log warn/error
-      docker logs --tail 50 "$name" 2>&1 | grep -Ei 'warn|error'
-
-    elif [[ "$event_type" == "start" && "$status" == "down" ]]; then
-      is_watched "$name" || continue
-      duration=$((epoch - die_time))
-      is_watched "$name" && watched=1 || watched=0
-
-      if (( watched )) && (( duration < 30 )); then
-        ./notify.sh "[$timestamp] 🔄 Vừa deploy lại $name (mất ${duration}s)"
-      elif (( watched )) && (( duration >= 30 )); then
-        ./notify.sh "[$timestamp] ✅ Service $name đã hồi phục sau ${duration}s downtime"
-      elif (( !watched )) && (( duration >= 30 )); then
-        ./notify.sh "[$timestamp] ❗️Service lạ [$name] đã UP. sau ${duration}s downtime"
+    elif [[ "$event_type" == "start" ]]; then
+      if ! is_watched "$name" && [[ "$name" != *migration* ]]; then
+        ./notify.sh "[$timestamp] ❗ Container [$name] have been started ✅."
       fi
 
-      write_state "$name" "up" 0 ""
+      if [[ "$status" == "down" ]]; then
+        duration=$((epoch - die_time))
+        
+        # Kiểm tra restart hay deploy mới
+        created_at=$(docker inspect -f '{{.Created}}' "$name" 2>/dev/null)
+        started_at=$(docker inspect -f '{{.State.StartedAt}}' "$name" 2>/dev/null)
+
+        if [[ "$created_at" != "$started_at" ]]; then
+          action="🔄 RESTART"
+        else
+          action="🚀 DEPLOY"
+        fi
+
+        if is_watched "$name"; then
+          if (( duration < 15 )); then
+            ./notify.sh "[$timestamp] $action service $name (downtime ${duration}s)"
+          else
+            ./notify.sh "[$timestamp] ✅ Service $name restored after ${duration}s ($action)"
+          fi
+        fi
+        write_state "$name" "up" 0 ""
+      fi
     fi
   done
 }
@@ -84,7 +117,6 @@ check_down_loop() {
     for state_file in "$STATE_DIR"/*.state; do
       [[ -f "$state_file" ]] || continue
       source "$state_file"
-
       name=$(basename "$state_file" .state)
       is_watched "$name" || continue
       [[ "$status" != "down" ]] && continue
@@ -104,9 +136,9 @@ check_down_loop() {
     sleep 10
   done
 }
-./notify.sh "Started monitor script"
 
-# 👉 Chạy song song
+./notify.sh "⚡ Started Docker Monitor"
+
 watch_events &
 check_down_loop &
 
