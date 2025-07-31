@@ -20,11 +20,13 @@ This script tracks container `start` and `die` events, records service states, a
 ---
 
 ## 📂 Folder Structure
+```
 .
 ├── watch.sh # Main monitoring script
 ├── notify.sh # Your notification handler (e.g., Slack, email)
 ├── watched_services.txt # List of container names to monitor
 └── state/ # Auto-generated state files for each container
+```
 
 
 ## 📝 How It Works
