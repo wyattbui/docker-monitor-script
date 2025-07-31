@@ -96,7 +96,7 @@ watch_events() {
         if [[ "$created_at" != "$started_at" ]]; then
           action="🔄 RESTART"
         else
-          action="🚀 DEPLOY"
+          action="⚡ DEPLOY"
         fi
 
         if is_watched "$name"; then
