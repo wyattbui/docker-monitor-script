@@ -137,9 +137,62 @@ check_down_loop() {
   done
 }
 
+last_alert_cpu=0
+last_alert_mem=0
+last_alert_disk=0
+alert_cpu_interval=60  # seconds
+alert_mem_interval=60  # seconds
+alert_disk_interval=300  # seconds
+
+check_system_resources() {
+  local timestamp=$(date "+%Y-%m-%d %H:%M:%S")
+  local now=$(date +%s)
+
+  cpu_usage=$(top -bn1 | grep "Cpu(s)" | awk '{print 100 - $8}' | cut -d. -f1)
+  disk_usage=$(df / | awk 'NR==2 {print $5}' | tr -d '%')
+
+  mem_info=$(free -m)
+  total_mem=$(echo "$mem_info" | awk '/Mem:/ {print $2}')
+  used_mem=$(echo "$mem_info" | awk '/Mem:/ {print $3}')
+  mem_usage=0
+  if [[ -z "$total_mem" || "$total_mem" -eq 0 ]]; then
+    mem_usage=0
+  else
+    mem_usage=$(( 100 * used_mem / total_mem ))
+  fi
+
+  # Thresholds
+  CPU_THRESHOLD=85
+  MEM_THRESHOLD=90
+  DISK_THRESHOLD=85
+
+  if (( cpu_usage >= CPU_THRESHOLD && now - last_alert_cpu > alert_cpu_interval )); then
+    ./notify.sh "[$timestamp] 🔥 High CPU usage: ${cpu_usage}%"
+    last_alert_cpu=$now
+  fi
+
+  if (( mem_usage >= MEM_THRESHOLD && now - last_alert_mem > alert_mem_interval )); then
+    ./notify.sh "[$timestamp] 🔥 High RAM usage: ${mem_usage}% (${used_mem}/${total_mem}MB)"
+    last_alert_mem=$now
+  fi
+
+  if (( disk_usage >= DISK_THRESHOLD && now - last_alert_disk > alert_disk_interval )); then
+    ./notify.sh "[$timestamp] 🔥 Disk usage high: ${disk_usage}%"
+    last_alert_disk=$now
+  fi
+}
+
+check_system_loop() {
+  while true; do
+    check_system_resources
+    sleep 15  # Kiểm tra mỗi 15 giây
+  done
+}
+
 ./notify.sh "⚡ Started Docker Monitor"
 
 watch_events &
 check_down_loop &
+check_system_loop &
 
 wait
