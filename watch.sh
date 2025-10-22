@@ -4,6 +4,8 @@ WATCHED_FILE="watched_services.txt"
 STATE_DIR="./state"
 mkdir -p "$STATE_DIR"
 
+JOBS_LOG="$STATE_DIR/jobs.log"
+
 get_epoch() {
   date +%s
 }
@@ -47,15 +49,22 @@ notify_container_die() {
   exit_code=$(echo "$exit_info" | awk '{print $1}')
   exit_error=$(echo "$exit_info" | cut -d' ' -f2-)
   pid=$(docker inspect -f '{{.State.Pid}}' "$name")
-  oom_log=$(dmesg -T | grep "$pid" | tail -n 3)
-  last_logs=$(docker logs --tail 50 "$name" 2>&1 | grep -Ei 'warn|error' | tail -n 10)
 
-  msg="[$timestamp] 🚨 Service [$name] DOWN.\n🧯 ExitCode=$exit_code"
-  [[ -n "$exit_error" && "$exit_error" != "<nil>" ]] && msg="$msg, Error: $exit_error"
-  [[ -n "$oom_log" ]] && msg="$msg\n💥 dmesg:\n$oom_log"
-  [[ -n "$last_logs" ]] && msg="$msg\n📋 Logs:\n$last_logs"
+  # Kiểm tra log OOM theo PID container
+  oom_log=$(dmesg -T | grep -E "Killed process[[:space:]]+$pid\b" | tail -n 10)
 
-  ./notify.sh "$msg"
+  # Lấy logs cuối nếu có lỗi
+  last_logs=$(docker logs --tail 50 "$name" 2>&1 | grep -Ei 'warn|error|out of memory' | tail -n 10)
+
+  # Nếu có OOM hoặc exit_code != 0 thì gửi notify
+  if [[ -n "$oom_log" || "$exit_code" -ne 0 ]]; then
+    msg="[$timestamp] 🚨 Service [$name] DOWN (PID=$pid)."
+    msg="$msg\n🧯 ExitCode=$exit_code"
+    [[ -n "$exit_error" && "$exit_error" != "<nil>" ]] && msg="$msg, Error: $exit_error"
+    [[ -n "$oom_log" ]] && msg="$msg\n💥 OOM Detected:\n$oom_log"
+    [[ -n "$last_logs" ]] && msg="$msg\n📋 Logs:\n$last_logs"
+    ./notify.sh "$msg"
+  fi
 }
 
 watch_events() {
@@ -80,8 +89,16 @@ watch_events() {
 
       notify_container_die "$name"
       write_state "$name" "down" "$epoch" ""
+    
+    
 
     elif [[ "$event_type" == "start" ]]; then
+      # Nếu là job dạng ecom-testing-task-* thì chỉ log, không notify ngay
+      if [[ "$name" == ecom-testing-task-* ]]; then
+        echo "$(date '+%Y-%m-%d %H:%M:%S'),$name" >> "$JOBS_LOG"
+        continue
+      fi
+
       if ! is_watched "$name" && [[ "$name" != *migration* ]]; then
         ./notify.sh "[$timestamp] ❗ Container [$name] have been started ✅."
       fi
@@ -96,7 +113,7 @@ watch_events() {
         if [[ "$created_at" != "$started_at" ]]; then
           action="🔄 RESTART"
         else
-          action="⚡ DEPLOY"
+          action="⚡DEPLOY"
         fi
 
         if is_watched "$name"; then
@@ -182,16 +199,86 @@ check_system_resources() {
   fi
 }
 
+last_heartbeat=0
+heartbeat_interval=$((6 * 3600))  # 6 giờ tính bằng giây
+send_heartbeat() {
+  local timestamp=$(date "+%Y-%m-%d %H:%M:%S")
+  local now=$(date +%s)
+
+  if (( now - last_heartbeat < heartbeat_interval )); then
+    return
+  fi
+
+  # Thu thập thông tin
+  cpu_usage=$(top -bn1 | grep "Cpu(s)" | awk '{print 100 - $8}' | cut -d. -f1)
+  mem_info=$(free -m)
+  total_mem=$(echo "$mem_info" | awk '/Mem:/ {print $2}')
+  used_mem=$(echo "$mem_info" | awk '/Mem:/ {print $3}')
+  mem_usage=0
+  if [[ -n "$total_mem" && "$total_mem" -ne 0 ]]; then
+    mem_usage=$(( 100 * used_mem / total_mem ))
+  fi
+  disk_usage=$(df / | awk 'NR==2 {print $5}' | tr -d '%')
+
+  # Gửi heartbeat
+  ./notify.sh "[$timestamp] [Heartbeat]: Monitor still alive.\nCPU: ${cpu_usage}%\nRAM: ${mem_usage}% (${used_mem}/${total_mem}MB)\nDisk: ${disk_usage}%"
+
+  last_heartbeat=$now
+}
+
 check_system_loop() {
   while true; do
     check_system_resources
+    send_heartbeat
     sleep 15  # Kiểm tra mỗi 15 giây
   done
 }
 
-./notify.sh "⚡ Started Docker Monitor"
+check_jobs_summary_loop() {
+  SUMMARY_LOG="$STATE_DIR/jobs_summary.log"
+
+  while true; do
+    if [[ -s "$JOBS_LOG" ]]; then
+      summary=$(awk -F',' '
+        {
+          job=$2
+          count[job]++
+          timestamps[job]=(timestamps[job] ? timestamps[job] "\n   • " $1 : "   • " $1)
+        }
+        END {
+          for (job in count) {
+            print "=============================="
+            print "📌 Job: " job
+            print "🔹 Số lần chạy: " count[job]
+            print "🔹 Các lần chạy:"
+            print timestamps[job]
+            print ""
+          }
+        }' "$JOBS_LOG")
+
+      echo "$summary" > "$SUMMARY_LOG"
+
+      # Chia nhỏ message nếu quá dài 
+      max_len=4000
+      msg="$summary"
+      while [[ -n "$msg" ]]; do
+        chunk=${msg:0:$max_len}
+        ./notify.sh "$chunk"
+        msg=${msg:$max_len}
+      done
+
+      # truncate thay vì rm
+      : > "$JOBS_LOG"
+    fi
+
+    sleep 3600 # 1 tiếng
+  done
+}
+
+
 
 watch_events &
+check_jobs_summary_loop &
 check_down_loop &
 check_system_loop &
 
